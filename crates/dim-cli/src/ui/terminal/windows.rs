@@ -2,7 +2,12 @@
 //! process (SetConsoleMode state is not reset on exit), so both are saved and
 //! put back on every exit path, including Ctrl+C/Ctrl+Break and window close.
 //!
-//! Compile-verified only (see the stage-2 acceptance notes).
+//! The code pages are console state of the same kind, so they are saved and
+//! put back the same way.
+//!
+//! Compile-verified only (see the stage-2 acceptance notes), except for the
+//! code-page exchange, which the ConPTY flow test at the end of this file
+//! checks on a console that runs a legacy code page.
 
 use std::io;
 use std::sync::OnceLock;
@@ -14,8 +19,9 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
     ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+    ENABLE_WRAP_AT_EOL_OUTPUT, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP,
+    GetConsoleScreenBufferInfo, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP,
+    SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP,
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -28,6 +34,12 @@ pub const STDOUT: RawFd = 1;
 static ORIGINAL: OnceLock<(u32, u32)> = OnceLock::new();
 static RAW_ON: AtomicBool = AtomicBool::new(false);
 static RESTORED: AtomicBool = AtomicBool::new(false);
+
+/// The code page the frames and keys are exchanged in: UTF-8.
+const UTF8_CODE_PAGE: u32 = 65001;
+
+/// The code pages in force before the terminal was taken.
+static ORIGINAL_CODE_PAGES: OnceLock<(u32, u32)> = OnceLock::new();
 
 fn handle(fd: RawFd) -> HANDLE {
     // SAFETY: GetStdHandle has no preconditions.
@@ -69,7 +81,38 @@ pub fn enable_raw_mode() -> io::Result<()> {
         }
     }
     RAW_ON.store(true, Ordering::SeqCst);
+    use_utf8_code_pages();
     Ok(())
+}
+
+/// Exchanges frames and keys as UTF-8.
+///
+/// A console decodes the bytes written to its output handle with the console
+/// output code page and encodes the keys it hands over with the console input
+/// code page, so a console that runs a legacy OEM page (CP850 on a Western
+/// European Windows, CP437 on a US one) shows every multi-byte UTF-8 sequence
+/// as mojibake and delivers typed characters as bytes the UTF-8 decoder drops.
+/// The code pages are console state that outlive the process, so the originals
+/// are kept and put back when the terminal is released.
+fn use_utf8_code_pages() {
+    // SAFETY: the console is attached, so the calls address it.
+    unsafe {
+        let (input, output) = (GetConsoleCP(), GetConsoleOutputCP());
+        let _ = ORIGINAL_CODE_PAGES.set((input, output));
+        SetConsoleCP(UTF8_CODE_PAGE);
+        SetConsoleOutputCP(UTF8_CODE_PAGE);
+    }
+}
+
+/// Puts the console code pages back.
+fn restore_code_pages() {
+    if let Some(&(input, output)) = ORIGINAL_CODE_PAGES.get() {
+        // SAFETY: the console is attached, so the calls address it.
+        unsafe {
+            SetConsoleCP(input);
+            SetConsoleOutputCP(output);
+        }
+    }
 }
 
 pub fn disable_raw_mode() {
@@ -82,6 +125,7 @@ pub fn disable_raw_mode() {
             SetConsoleMode(handle(STDOUT), out_mode);
         }
     }
+    restore_code_pages();
 }
 
 pub fn write_all(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
@@ -200,4 +244,114 @@ pub fn install_signal_guard() {
 pub fn remove_signal_guard() {
     // SAFETY: removing the handler registered above.
     unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 0) };
+}
+
+#[cfg(all(test, windows))]
+mod windows_flow {
+    use super::*;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::{
+        io::Read,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    /// The code page a Windows console runs unless something sets UTF-8: CP437
+    /// on a US Windows, CP850 on a Western European one.
+    const LEGACY_CODE_PAGE: u32 = 437;
+
+    /// A middot, the character the interface puts between labels.
+    const MIDDOT: &str = "\u{b7}";
+
+    /// A frame painted on a console that runs a legacy code page reaches the
+    /// terminal as UTF-8, and the console keeps the code page it had.
+    #[test]
+    fn a_frame_reaches_a_legacy_code_page_console_as_utf8() {
+        if std::env::var_os("DIM_CLI_CONSOLE_CODE_PAGE_CHILD").is_some() {
+            child();
+            return;
+        }
+        parent();
+    }
+
+    /// The child: a console on a legacy code page, painting one frame.
+    fn child() {
+        // SAFETY: the console is attached, so the call addresses it.
+        unsafe {
+            SetConsoleOutputCP(LEGACY_CODE_PAGE);
+        }
+        enable_raw_mode().expect("raw mode");
+        write_all(STDOUT, MIDDOT.as_bytes()).expect("frame");
+        disable_raw_mode();
+        // SAFETY: the console is attached, so the call addresses it.
+        let restored = unsafe { GetConsoleOutputCP() };
+        write_all(STDOUT, restored.to_string().as_bytes()).expect("code page");
+    }
+
+    /// The parent: the console the child painted on.
+    fn parent() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
+        command.env("DIM_CLI_CONSOLE_CODE_PAGE_CHILD", "1");
+        command.args([
+            "--exact",
+            "ui::terminal::windows::windows_flow::a_frame_reaches_a_legacy_code_page_console_as_utf8",
+            "--nocapture",
+        ]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        if tx.send(buf[..size].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let restored = LEGACY_CODE_PAGE.to_string();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(bytes) => {
+                    output.extend_from_slice(&bytes);
+                    if output
+                        .windows(restored.len())
+                        .any(|w| w == restored.as_bytes())
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            output.windows(MIDDOT.len()).any(|w| w == MIDDOT.as_bytes()),
+            "the frame did not reach the terminal as UTF-8: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            output
+                .windows(LEGACY_CODE_PAGE.to_string().len())
+                .any(|w| w == LEGACY_CODE_PAGE.to_string().as_bytes()),
+            "the console kept the code page the terminal took: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
